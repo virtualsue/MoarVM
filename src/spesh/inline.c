@@ -188,7 +188,7 @@ static void fix_wval(MVMThreadContext *tc, MVMSpeshGraph *inliner,
     }
     else {
         MVM_oops(tc,
-            "Spesh inline: invalid SC index found");
+            "Spesh inline: invalid SC index %d found", dep);
     }
 }
 
@@ -224,9 +224,10 @@ static void rewrite_outer_lookup(MVMThreadContext *tc, MVMSpeshGraph *g,
 }
 
 /* Merges the inlinee's spesh graph into the inliner. */
-static void merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
+MVMSpeshBB * merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
                  MVMSpeshGraph *inlinee, MVMStaticFrame *inlinee_sf,
-                 MVMSpeshIns *invoke_ins, MVMSpeshOperand code_ref_reg) {
+                 MVMSpeshBB *invoke_bb, MVMSpeshIns *invoke_ins,
+                 MVMSpeshOperand code_ref_reg) {
     MVMSpeshFacts **merged_facts;
     MVMuint16      *merged_fact_counts;
     MVMint32        i, total_inlines, orig_deopt_addrs;
@@ -337,19 +338,11 @@ static void merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
         bb = bb->linear_next;
     }
 
-    /* Incorporate the basic blocks by concatening them onto the end of the
-     * linear_next chain of the inliner; skip the inlinee's fake entry BB. */
-    bb = inliner->entry;
-    while (bb) {
-        if (!bb->linear_next) {
-            /* Found the end; insert and we're done. */
-            bb->linear_next = inlinee_first_bb = inlinee->entry->linear_next;
-            bb = NULL;
-        }
-        else {
-            bb = bb->linear_next;
-        }
-    }
+    bb = invoke_bb->linear_next;
+    invoke_bb->linear_next = inlinee_first_bb = inlinee->entry->linear_next;
+    inlinee_last_bb->linear_next = bb;
+
+    bb = NULL;
 
     /* Make all of the inlinee's entry block's successors (except the linear
      * next) also be successors of the inliner's entry block; this keeps any
@@ -389,7 +382,7 @@ static void merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
      * some extra spesh slots. */
     if (!same_comp_unit) {
         bb = inlinee->entry;
-        while (bb) {
+        while (1) {
             MVMSpeshIns *ins = bb->first_ins;
             while (ins) {
                 MVMuint16 opcode = ins->info->opcode;
@@ -397,6 +390,7 @@ static void merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
                     fix_wval(tc, inliner, inlinee, ins);
                 ins = ins->next;
             }
+            if (bb == inlinee_last_bb) break;
             bb = bb->linear_next;
         }
     }
@@ -531,8 +525,16 @@ static void merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
             orig_handlers * sizeof(MVMSpeshIns *));
         MVMint32 found_invoke = 0;
         bb = inliner->entry;
-        while (bb && !bb->inlined) {
+        while (bb) {
             MVMSpeshIns *ins = bb->first_ins;
+            /* Inlinees are self-contained with regards to handlers, so we
+             * don't have to look into them. */
+            while (bb && bb != inlinee_last_bb) {
+                bb = bb->linear_next;
+            }
+            if (!bb) {
+                break;
+            }
             while (ins) {
                 MVMSpeshAnn *ann = ins->annotations;
                 while (ann) {
@@ -613,6 +615,8 @@ static void merge_graph(MVMThreadContext *tc, MVMSpeshGraph *inliner,
     inliner->num_locals   += inlinee->num_locals;
     inliner->num_lexicals += inlinee->num_lexicals;
     inliner->num_handlers += inlinee->num_handlers + active_handlers_at_invoke;
+
+    return inlinee_last_bb;
 }
 
 /* Tweak the successor of a BB, also updating the target BBs pred. */
@@ -672,7 +676,7 @@ static void return_to_box(MVMThreadContext *tc, MVMSpeshGraph *g, MVMSpeshBB *re
     box_operands[2]               = target;
     MVM_spesh_manipulate_insert_ins(tc, return_bb, return_ins, box_ins);
 
-    /* Now turn return instruction node into lookup of appropraite box
+    /* Now turn return instruction node into lookup of appropriate box
      * type. */
     return_ins->info        = MVM_op_get_op(box_type_op);
     return_ins->operands[0] = target;
@@ -755,7 +759,7 @@ static void rewrite_obj_return(MVMThreadContext *tc, MVMSpeshGraph *g,
 
 static void rewrite_returns(MVMThreadContext *tc, MVMSpeshGraph *inliner,
                      MVMSpeshGraph *inlinee, MVMSpeshBB *invoke_bb,
-                     MVMSpeshIns *invoke_ins) {
+                     MVMSpeshIns *invoke_ins, MVMSpeshBB *inlinee_last_bb) {
     /* Locate return instructions. */
     MVMSpeshBB *bb = inlinee->entry;
     while (bb) {
@@ -801,6 +805,7 @@ static void rewrite_returns(MVMThreadContext *tc, MVMSpeshGraph *inliner,
             }
             ins = ins->next;
         }
+        if (bb == inlinee_last_bb) break;
         bb = bb->linear_next;
     }
 }
@@ -809,7 +814,7 @@ static void rewrite_returns(MVMThreadContext *tc, MVMSpeshGraph *inliner,
  * register set operations. */
 static void rewrite_args(MVMThreadContext *tc, MVMSpeshGraph *inliner,
                   MVMSpeshGraph *inlinee, MVMSpeshBB *invoke_bb,
-                  MVMSpeshCallInfo *call_info) {
+                  MVMSpeshCallInfo *call_info, MVMSpeshBB *inlinee_last_bb) {
     /* Look for param-taking instructions. Track what arg instructions we
      * use in the process. */
     MVMSpeshBB *bb = inlinee->entry;
@@ -866,6 +871,7 @@ static void rewrite_args(MVMThreadContext *tc, MVMSpeshGraph *inliner,
             }
             ins = next;
         }
+        if (bb == inlinee_last_bb) break;
         bb = bb->linear_next;
     }
 
@@ -908,9 +914,10 @@ static void rewrite_args(MVMThreadContext *tc, MVMSpeshGraph *inliner,
 /* Annotates first and last instruction in post-processed inlinee with start
  * and end inline annotations. */
 static void annotate_inline_start_end(MVMThreadContext *tc, MVMSpeshGraph *inliner,
-                               MVMSpeshGraph *inlinee, MVMint32 idx) {
+                               MVMSpeshGraph *inlinee, MVMint32 idx, MVMSpeshBB *inlinee_last_bb) {
     /* Annotate first instruction. */
     MVMSpeshAnn *start_ann     = MVM_spesh_alloc(tc, inliner, sizeof(MVMSpeshAnn));
+    MVMSpeshAnn *end_ann       = MVM_spesh_alloc(tc, inliner, sizeof(MVMSpeshAnn));
     MVMSpeshBB *bb             = inlinee->entry->succ[0];
     start_ann->next            = bb->first_ins->annotations;
     start_ann->type            = MVM_SPESH_ANN_INLINE_START;
@@ -918,16 +925,12 @@ static void annotate_inline_start_end(MVMThreadContext *tc, MVMSpeshGraph *inlin
     bb->first_ins->annotations = start_ann;
 
     /* Now look for last instruction and annotate it. */
-    while (bb) {
-        if (!bb->linear_next) {
-            MVMSpeshAnn *end_ann      = MVM_spesh_alloc(tc, inliner, sizeof(MVMSpeshAnn));
-            end_ann->next             = bb->last_ins->annotations;
-            end_ann->type             = MVM_SPESH_ANN_INLINE_END;
-            end_ann->data.inline_idx  = idx;
-            bb->last_ins->annotations = end_ann;
-        }
-        bb = bb->linear_next;
-    }
+    end_ann->next             = inlinee_last_bb->last_ins->annotations;
+    end_ann->type             = MVM_SPESH_ANN_INLINE_END;
+    end_ann->data.inline_idx  = idx;
+    inlinee_last_bb->last_ins->annotations = end_ann;
+
+    return;
 }
 
 /* Drives the overall inlining process. */
@@ -936,7 +939,7 @@ void MVM_spesh_inline(MVMThreadContext *tc, MVMSpeshGraph *inliner,
                       MVMSpeshIns *invoke_ins, MVMSpeshGraph *inlinee,
                       MVMStaticFrame *inlinee_sf, MVMSpeshOperand code_ref_reg) {
     /* Merge inlinee's graph into the inliner. */
-    merge_graph(tc, inliner, inlinee, inlinee_sf, invoke_ins, code_ref_reg);
+    MVMSpeshBB *inlinee_last_bb = merge_graph(tc, inliner, inlinee, inlinee_sf, invoke_bb, invoke_ins, code_ref_reg);
 
     /* If we're profiling, note it's an inline. */
     if (inlinee->entry->linear_next->first_ins->info->opcode == MVM_OP_prof_enterspesh) {
@@ -948,14 +951,14 @@ void MVM_spesh_inline(MVMThreadContext *tc, MVMSpeshGraph *inliner,
     }
 
     /* Re-write returns to a set and goto. */
-    rewrite_returns(tc, inliner, inlinee, invoke_bb, invoke_ins);
+    rewrite_returns(tc, inliner, inlinee, invoke_bb, invoke_ins, inlinee_last_bb);
 
     /* Re-write the argument passing instructions to poke values into the
      * appropriate slots. */
-    rewrite_args(tc, inliner, inlinee, invoke_bb, call_info);
+    rewrite_args(tc, inliner, inlinee, invoke_bb, call_info, inlinee_last_bb);
 
     /* Annotate first and last instruction with inline table annotations. */
-    annotate_inline_start_end(tc, inliner, inlinee, inliner->num_inlines - 1);
+    annotate_inline_start_end(tc, inliner, inlinee, inliner->num_inlines - 1, inlinee_last_bb);
 
     /* Finally, turn the invoke instruction into a goto. */
     invoke_ins->info = MVM_op_get_op(MVM_OP_goto);
